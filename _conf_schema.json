@@ -1,0 +1,27 @@
+{
+  "error_keywords": {
+    "description": "触发切换的错误关键词",
+    "type": "text",
+    "hint": "当原模型回复中包含这些关键词时，将丢弃该回复并改为请求下方选择的备用 LLM 提供商。每行一个，匹配时不区分大小写。",
+    "default": "api 返回的内容为空\nAPI 返回的 completion 由于内容安全过滤被拒绝(非 AstrBot)\n调用失败"
+  },
+  "provider_id": {
+    "description": "备用 LLM 提供商",
+    "type": "string",
+    "hint": "选择 AstrBot 中已经配置好的 LLM 提供商。留空时会使用当前会话正在使用的提供商。",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "forward_images": {
+    "description": "向备用提供商转发图片",
+    "type": "bool",
+    "hint": "只有当你选择的备用 LLM 提供商明确支持多模态/图片输入时才开启。关闭时会移除上下文中的 image_url，避免不支持图片的 OpenAI 兼容接口报 400。",
+    "default": false
+  },
+  "fallback_reply": {
+    "description": "备用 LLM 提供商失败时的兜底回复",
+    "type": "text",
+    "hint": "当命中关键词后备用 LLM 提供商也失败时返回给用户的内容；留空则不覆盖原流程。",
+    "default": "抱歉，备用模型暂时也不可用，请稍后再试。"
+  }
+}
