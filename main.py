@@ -31,7 +31,21 @@ class Main(Star):
             item.strip().lower() for item in str(keywords_str).split("\n") if item.strip()
         ]
 
-        self.provider_id = str(config.get("provider_id", "")).strip()
+        # 轮换顺序：先用下拉选的 provider_id，再依次用文本框里的 provider_ids
+        single = str(config.get("provider_id", "")).strip()
+        provider_ids_str = str(config.get("provider_ids", "")).strip()
+        extra = [p.strip() for p in provider_ids_str.split("\n") if p.strip()]
+        # 合并去重，保持顺序
+        seen: set = set()
+        merged: list = []
+        for p in ([single] if single else []) + extra:
+            if p not in seen:
+                seen.add(p)
+                merged.append(p)
+        # 都为空则运行时自动取当前会话 provider
+        self.provider_ids = merged if merged else [None]
+
+        self.provider_id = single
         self.forward_images = self._to_bool(config.get("forward_images", False))
         self.fallback_reply = str(
             config.get(
@@ -106,8 +120,65 @@ class Main(Star):
                 item["content"] = self._strip_image_parts_from_content(item.get("content"))
         return contexts
 
-    async def _call_configured_provider(self, event: AstrMessageEvent, stored: Dict[str, Any]):
-        provider_id = self.provider_id
+    def _list_providers(self) -> list:
+        """返回 (provider_id, model_name) 列表。"""
+        result = []
+        try:
+            for prov in self.context.get_all_providers() or []:
+                pid = ""
+                model = ""
+                try:
+                    meta = prov.meta()
+                    pid = str(getattr(meta, "id", "") or "")
+                    model = str(getattr(meta, "model", "") or "")
+                except Exception:
+                    pass
+                if not pid:
+                    pid = str(getattr(prov, "provider_config", {}).get("id", "") or "")
+                if not model and hasattr(prov, "get_model"):
+                    try:
+                        model = str(prov.get_model() or "")
+                    except Exception:
+                        pass
+                if pid:
+                    result.append((pid, model))
+        except Exception as exc:
+            logger.warning(f"枚举 LLM 提供商失败: {exc}")
+        return result
+
+    def _resolve_provider_id(self, raw: str) -> str:
+        """把用户填写的值解析成真实 Provider ID。支持直接填 Provider ID 或模型名。"""
+        raw = str(raw).strip()
+        if not raw:
+            return raw
+        providers = self._list_providers()
+        if not providers:
+            return raw
+
+        ids = [pid for pid, _ in providers]
+        # 1. 精确匹配 Provider ID
+        if raw in ids:
+            return raw
+        lowered = raw.lower()
+        # 2. 忽略大小写匹配 Provider ID
+        for pid in ids:
+            if pid.lower() == lowered:
+                return pid
+        # 3. 按模型名匹配
+        for pid, model in providers:
+            if model and model.lower() == lowered:
+                logger.info(f"'{raw}' 是模型名，已解析为 Provider ID '{pid}'。")
+                return pid
+        # 4. 匹配 "id/model" 形式的后半段
+        for pid, _ in providers:
+            if "/" in pid and pid.split("/")[-1].lower() == lowered:
+                logger.info(f"'{raw}' 已模糊匹配到 Provider ID '{pid}'。")
+                return pid
+        return raw
+
+    async def _call_provider(self, event: AstrMessageEvent, stored: Dict[str, Any], provider_id: Optional[str]):
+        if provider_id:
+            provider_id = self._resolve_provider_id(provider_id)
         if not provider_id:
             provider_id = await self.context.get_current_chat_provider_id(
                 umo=getattr(event, "unified_msg_origin", None)
@@ -138,7 +209,32 @@ class Main(Star):
     def _set_text_result(self, event: AstrMessageEvent, text: str) -> None:
         event.set_result(event.plain_result(text))
 
-    async def _handle_keyword_hit(self, event: AstrMessageEvent, request_key: str, text: str) -> bool:
+    def _apply_replacement(self, event: AstrMessageEvent, text: str, resp: Any = None) -> None:
+        """写回替换后的文本。
+
+        在 on_llm_response 阶段必须直接改 resp 对象：AstrBot 在钩子返回后会用
+        resp 重新构建 MessageChain 并 set_result，此时任何 event.set_result
+        都会被覆盖。
+
+        注意：completion_text 是 property，当 resp.result_chain 存在时 setter 会把
+        文本写进 result_chain（先剔除所有 Plain 再插入新的），getter 也从 result_chain
+        取值。因此绝不能在赋值后再清空 result_chain，否则 getter 会回退到空的
+        _completion_text，替换结果丢失。
+        """
+        if resp is not None:
+            try:
+                resp.completion_text = text
+            except Exception as exc:
+                logger.warning(f"直接改写 LLMResponse 失败，回退到 set_result: {exc}")
+        self._set_text_result(event, text)
+
+    async def _handle_keyword_hit(
+        self,
+        event: AstrMessageEvent,
+        request_key: str,
+        text: str,
+        resp: Any = None,
+    ) -> bool:
         keyword = self._find_error_keyword(text)
         if not keyword:
             return False
@@ -147,21 +243,43 @@ class Main(Star):
             return False
         self.processed_requests.add(request_key)
 
-        logger.warning(f"检测到错误关键词 '{keyword}'，放弃原回复并调用备用 LLM 提供商。")
+        logger.warning(f"检测到错误关键词 '{keyword}'，开始轮换备用 LLM 提供商。")
         stored = self.pending_requests.get(request_key, {"prompt": event.message_str or "", "contexts": [], "image_urls": []})
 
+        # 构建轮换列表：有配置则用列表，否则尝试当前会话 provider（传 None 让 _call_provider 自动获取）
+        providers_to_try: list = list(self.provider_ids) if self.provider_ids else [None]
+
         try:
-            llm_resp = await self._call_configured_provider(event, stored)
-            new_text = self._extract_llm_response_text(llm_resp)
-            if not new_text:
-                raise RuntimeError("备用 LLM 提供商返回成功，但未提取到文本内容")
-            self._set_text_result(event, new_text)
-            logger.info("备用 LLM 提供商调用成功，已替换原始回复。")
-            return True
-        except Exception as exc:
-            logger.error(f"调用备用 LLM 提供商失败: {exc}", exc_info=True)
+            for provider_id in providers_to_try:
+                label = provider_id or "(当前会话 provider)"
+                try:
+                    llm_resp = await self._call_provider(event, stored, provider_id)
+                    new_text = self._extract_llm_response_text(llm_resp)
+                    if not new_text:
+                        logger.warning(f"备用提供商 {label} 返回成功但无文本，尝试下一个。")
+                        continue
+                    hit = self._find_error_keyword(new_text)
+                    if hit:
+                        logger.warning(f"备用提供商 {label} 的回复仍含关键词 '{hit}'，尝试下一个。")
+                        continue
+                    self._apply_replacement(event, new_text, resp)
+                    logger.info(f"备用提供商 {label} 调用成功，已替换原始回复。")
+                    return True
+                except Exception as exc:
+                    logger.error(f"调用备用提供商 {label} 失败: {exc}", exc_info=True)
+                    if "not found" in str(exc).lower():
+                        available = self._list_providers()
+                        if available:
+                            hint = "，".join(
+                                f"{pid}（模型 {model or '未知'}）" for pid, model in available
+                            )
+                            logger.error(f"当前可用的 Provider ID：{hint}")
+                    continue
+
+            # 全部耗尽
+            logger.error("所有备用 LLM 提供商均失败或仍含关键词，使用兜底回复。")
             if self.fallback_reply.strip():
-                self._set_text_result(event, self.fallback_reply.strip())
+                self._apply_replacement(event, self.fallback_reply.strip(), resp)
                 return True
             return False
         finally:
@@ -171,8 +289,12 @@ class Main(Star):
     async def retry_on_llm_response(self, event: AstrMessageEvent, resp):
         request_key = self._get_request_key(event)
         text = getattr(resp, "completion_text", "") or ""
+        if not text:
+            result_chain = getattr(resp, "result_chain", None)
+            if result_chain and hasattr(result_chain, "get_plain_text"):
+                text = result_chain.get_plain_text() or ""
         if text:
-            await self._handle_keyword_hit(event, request_key, text)
+            await self._handle_keyword_hit(event, request_key, text, resp=resp)
 
     @filter.on_decorating_result(priority=-100)
     async def check_and_replace(self, event: AstrMessageEvent, *args, **kwargs):

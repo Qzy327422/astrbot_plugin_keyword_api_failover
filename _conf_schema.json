@@ -6,11 +6,17 @@
     "default": "api 返回的内容为空\nAPI 返回的 completion 由于内容安全过滤被拒绝(非 AstrBot)\n调用失败"
   },
   "provider_id": {
-    "description": "备用 LLM 提供商",
+    "description": "第一备用 LLM 提供商",
     "type": "string",
-    "hint": "选择 AstrBot 中已经配置好的 LLM 提供商。留空时会使用当前会话正在使用的提供商。",
+    "hint": "命中关键词后优先调用此提供商。若其回复仍含关键词或调用失败，再依次尝试下方列表中的提供商。",
     "default": "",
     "_special": "select_provider"
+  },
+  "provider_ids": {
+    "description": "后续备用 LLM 提供商列表（按顺序轮换）",
+    "type": "text",
+    "hint": "每行填写一个 Provider ID（不是模型名）。Provider ID 是你在 AstrBot 服务商配置页给该提供商起的名称，可在上方“选择提供商...”弹窗中查看。当上方选择的提供商也命中关键词或失败时，依次尝试此列表。留空则只用上方选择的提供商。",
+    "default": ""
   },
   "forward_images": {
     "description": "向备用提供商转发图片",
