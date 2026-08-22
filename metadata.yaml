@@ -1,5 +1,5 @@
 name: astrbot_plugin_keyword_api_failover
 desc: 当原模型回复命中指定错误关键词时，放弃该回复并改为调用可配置的备用 API 返回结果。
-version: v1.0.0
+version: v1.1.0
 author: WDNMD
 repo: https://github.com/Qzy327422/astrbot_plugin_keyword_api_failover
