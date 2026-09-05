@@ -14,6 +14,7 @@ class Main(Star):
         super().__init__(context)
         self.pending_requests: Dict[str, Dict[str, Any]] = {}
         self.processed_requests: set[str] = set()
+        self.replaced_texts: Dict[str, str] = {}
         self._parse_config(config)
 
         metadata = getattr(self, "metadata", None)
@@ -209,7 +210,13 @@ class Main(Star):
     def _set_text_result(self, event: AstrMessageEvent, text: str) -> None:
         event.set_result(event.plain_result(text))
 
-    def _apply_replacement(self, event: AstrMessageEvent, text: str, resp: Any = None) -> None:
+    def _apply_replacement(
+        self,
+        event: AstrMessageEvent,
+        request_key: str,
+        text: str,
+        resp: Any = None,
+    ) -> None:
         """写回替换后的文本。
 
         在 on_llm_response 阶段必须直接改 resp 对象：AstrBot 在钩子返回后会用
@@ -220,7 +227,12 @@ class Main(Star):
         文本写进 result_chain（先剔除所有 Plain 再插入新的），getter 也从 result_chain
         取值。因此绝不能在赋值后再清空 result_chain，否则 getter 会回退到空的
         _completion_text，替换结果丢失。
+
+        改 resp 只影响展示。会话历史存的是 run_context.messages 里的 TextPart 快照，
+        那份快照在触发本钩子之前就已建立，必须在 on_agent_done 里单独改写，
+        所以这里把新文本记下来交给 rewrite_history。
         """
+        self.replaced_texts[request_key] = text
         if resp is not None:
             try:
                 resp.completion_text = text
@@ -262,7 +274,7 @@ class Main(Star):
                     if hit:
                         logger.warning(f"备用提供商 {label} 的回复仍含关键词 '{hit}'，尝试下一个。")
                         continue
-                    self._apply_replacement(event, new_text, resp)
+                    self._apply_replacement(event, request_key, new_text, resp)
                     logger.info(f"备用提供商 {label} 调用成功，已替换原始回复。")
                     return True
                 except Exception as exc:
@@ -279,7 +291,9 @@ class Main(Star):
             # 全部耗尽
             logger.error("所有备用 LLM 提供商均失败或仍含关键词，使用兜底回复。")
             if self.fallback_reply.strip():
-                self._apply_replacement(event, self.fallback_reply.strip(), resp)
+                self._apply_replacement(
+                    event, request_key, self.fallback_reply.strip(), resp
+                )
                 return True
             return False
         finally:
@@ -296,12 +310,46 @@ class Main(Star):
         if text:
             await self._handle_keyword_hit(event, request_key, text, resp=resp)
 
+    @filter.on_agent_done()
+    async def rewrite_history(self, event: AstrMessageEvent, run_context, response):
+        """把替换后的文本写进会话历史。
+
+        存进数据库的不是 LLMResponse，而是 run_context.messages 里那条 assistant
+        消息的 TextPart —— 它在 on_llm_response 触发之前就已经用原始文本建好了，
+        改 resp.completion_text 追不回去。on_agent_done 紧接在 on_llm_response
+        之后触发，且仍早于 _save_to_history，是唯一能改到历史的时机。
+        不修的话，下一轮对话模型会在上下文里看到自己上一轮的拒答文本。
+        """
+        request_key = self._get_request_key(event)
+        new_text = self.replaced_texts.pop(request_key, None)
+        if not new_text:
+            return
+
+        messages = getattr(run_context, "messages", None) or []
+        for message in reversed(messages):
+            if getattr(message, "role", "") != "assistant":
+                continue
+            content = getattr(message, "content", None)
+            if not isinstance(content, list):
+                logger.warning("assistant 消息的 content 不是分片列表，无法改写历史。")
+                return
+            text_parts = [p for p in content if getattr(p, "type", None) == "text"]
+            if not text_parts:
+                logger.warning("assistant 消息中没有文本分片，无法改写历史。")
+                return
+            text_parts[0].text = new_text
+            for extra in text_parts[1:]:
+                content.remove(extra)
+            logger.info("已将备用模型的回复同步写入会话历史。")
+            return
+
     @filter.on_decorating_result(priority=-100)
     async def check_and_replace(self, event: AstrMessageEvent, *args, **kwargs):
         request_key = self._get_request_key(event)
         if request_key in self.processed_requests:
             self.processed_requests.discard(request_key)
             self.pending_requests.pop(request_key, None)
+            self.replaced_texts.pop(request_key, None)
             return
 
         result = event.get_result()
@@ -313,8 +361,15 @@ class Main(Star):
         handled = await self._handle_keyword_hit(event, request_key, text)
         if not handled:
             self.pending_requests.pop(request_key, None)
+        # 本阶段已晚于 on_agent_done，历史快照改不到了，丢掉记录避免滞留
+        if self.replaced_texts.pop(request_key, None):
+            logger.warning(
+                "关键词是在 on_decorating_result 阶段才命中的，已晚于历史保存时机，"
+                "本次替换只影响发出去的内容。若该回复来自 LLM，会话历史里仍是原始回复。"
+            )
 
     async def terminate(self):
         self.pending_requests.clear()
         self.processed_requests.clear()
+        self.replaced_texts.clear()
         logger.info("已卸载 [KeywordApiFailover] 插件并清理缓存。")
