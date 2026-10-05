@@ -60,16 +60,40 @@ class Main(Star):
             return value
         return str(value).strip().lower() in {"1", "true", "yes", "on", "启用", "是"}
 
+    _KEY_EXTRA = "_keyword_api_failover_key"
+
     def _get_request_key(self, event: AstrMessageEvent) -> str:
+        """取本次事件的唯一键，并缓存在 event 上。
+
+        不能每次现算：key 里若掺入 event.message_str，而该字段在管线中途会被
+        其他插件改写（去唤醒前缀、合并消息、引用解析等），on_llm_response 算出
+        的 key 就跟 on_llm_request 存的对不上，pending_requests 取不到东西，
+        进而丢掉 system_prompt 和 contexts，备用模型会脱离人格裸答。
+        整个管线共享同一个 event 对象，所以挂在 event 上最稳。
+        """
+        cached = event.get_extra(self._KEY_EXTRA)
+        if cached:
+            return str(cached)
+
         message_id = getattr(event.message_obj, "message_id", "")
         sender_id = event.get_sender_id()
         session_info = getattr(event, "unified_msg_origin", "")
         content = getattr(event, "message_str", "") or ""
-        digest = hashlib.sha256(f"{sender_id}:{session_info}:{message_id}:{content}".encode("utf-8")).hexdigest()[:16]
-        return f"keyword_api_failover:{sender_id}:{message_id}:{digest}"
+        digest = hashlib.sha256(
+            f"{sender_id}:{session_info}:{message_id}:{content}".encode("utf-8")
+        ).hexdigest()[:16]
+        key = f"keyword_api_failover:{sender_id}:{message_id}:{digest}"
+        event.set_extra(self._KEY_EXTRA, key)
+        return key
 
-    @filter.on_llm_request(priority=200)
+    @filter.on_llm_request(priority=-200)
     async def store_llm_request(self, event: AstrMessageEvent, req):
+        """快照最终发给原模型的请求，供备用模型复用。
+
+        priority 必须足够低，让本钩子在其他插件之后执行。钩子按 -priority 排序，
+        原来的 200 会让本插件抢在 AstrBot 内置的群聊上下文注入器和各类记忆插件
+        （它们都是默认 priority=0）之前拍快照，备用模型拿到的提示词比原模型少一截。
+        """
         if not hasattr(req, "prompt") or not hasattr(req, "contexts"):
             return
 
@@ -256,7 +280,18 @@ class Main(Star):
         self.processed_requests.add(request_key)
 
         logger.warning(f"检测到错误关键词 '{keyword}'，开始轮换备用 LLM 提供商。")
-        stored = self.pending_requests.get(request_key, {"prompt": event.message_str or "", "contexts": [], "image_urls": []})
+        stored = self.pending_requests.get(request_key)
+        if stored is None:
+            # 兜底字典里没有 system_prompt，备用模型会丢掉人格裸答，所以要吵一声。
+            logger.warning(
+                "未找到本次请求的原始上下文，备用模型将失去人格与历史记录。"
+            )
+            stored = {
+                "prompt": event.message_str or "",
+                "contexts": [],
+                "image_urls": [],
+                "system_prompt": "",
+            }
 
         # 构建轮换列表：有配置则用列表，否则尝试当前会话 provider（传 None 让 _call_provider 自动获取）
         providers_to_try: list = list(self.provider_ids) if self.provider_ids else [None]
